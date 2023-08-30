@@ -1,0 +1,7 @@
+{
+	"node": "n8n-nodes-json-database.JsonDatabase",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"alias": ["JSON", "Database", "Storage", "KV", "Key-Value", "Tree", "Hierarchical", "On-Disk", "Permanent", "Persistent"],
+	"categories": ["Data & Storage"]
+}
