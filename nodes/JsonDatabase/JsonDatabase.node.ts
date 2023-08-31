@@ -3,7 +3,7 @@ import {
 	INodeTypeDescription,
 	IExecuteFunctions,
 	INodeExecutionData,
-//	NodeOperationError,
+	NodeOperationError,
 } from 'n8n-workflow';
 
 import {
@@ -11,101 +11,108 @@ import {
 	readFileSync,
 	writeFileSync,
 	mkdirSync,
+	rmSync,
 } from 'fs';
 
 const _ = require('../../lib/lodash.custom.min.js');
 
 export interface IJsonObject {[key: string]: any};
 
-//async function selectJsonBranch(object: IJsonObject, query: string): Promise<IJsonObject> {
-//	let pathTree = [];
-//	let wordBuffer = '';
-//	let inLiteral = { wrap: false, quote: false };
-	// Note: it's always implied that if we are in a quote then we must be in a wrap (or the opposite)
-	/*for (char of query) {
-		if (!inLiteral.wrap)
-		{
-			if ('.['.includes(char))
-			{
-				pathTree = [...pathTree, wordBuffer];
-				wordBuffer = '';
-				
-			}
-			else
-			{
-				wordBuffer += char;
-			}
-		}
-		else
-		if (inLiteral.wrap && !inLiteral.quote)
-		{
-			
-		}
-		else
-		if (inLiteral.quote)
-		{
-			
-		}
-/*		if (!inLiteral.quote && query[c] === '.')
-		{
-			
-		}
-		else
-		if (!inLiteral.quote && !inLiteral.wrap && query[c] === '[')
-		{
-			inLiteral.wrap = true;
-		}
-		else
-		if (!inLiteral.quote && inLiteral.wrap &&  query[c] === '[')
-		{
+// <https://stackoverflow.com/questions/951021/what-is-the-javascript-version-of-sleep#39914235>
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-		}
-		else
-		if (inLiteral.quote && inLiteral.wrap && query[c] === '[')
-		{
-			inLiteral.wrap = true;
-		}
-		else
-		if (!inLiteral.quote && inLiteral.wrap && query[c] === ']')
-		{
-			inLiteral.wrap = false;
-		}
-		else
-		{
-			wordBuffer += query[c];
-		}
-*/
-//	}
-//	
-//	return branch;
-//}
-
-async function handleJsonOperation(options: IJsonObject): Promise<IJsonObject> {
+async function handleJsonOperation(execFunctions: IExecuteFunctions, itemIndex: number, options: IJsonObject): Promise<IJsonObject> {
+	const lockTime = 20000;
 	let queryPath = options.queryPath.trim();
 	let filePath = options.filePath.trim();
 	// the .n8n directory (when not in a dev environment)
 	filePath ||= `${__dirname}/../../../../../../../JsonDatabase.Global.json`;
-	// handle default database in another dir if .n8n/... is not writable
-	//...
+	const directory = filePath.split('/').slice(0, -1).join('/');
+	const lockPath = (existsSync(filePath) || (!existsSync(filePath) && options.operation === 'opWrite')
+		? `${directory}/~${filePath.split('/').slice(-1)[0]}.lock`
+		: false
+	);
+	function updateLockTime() {
+		writeFileSync(`${lockPath}/time`, Date.now().toString());
+	}
 	let database: IJsonObject = {};
+	let lockTimeUpdater;
+	if (lockPath) {
+		while (true) {
+			try {
+				// we acquire the file lock
+				mkdirSync(lockPath, { recursive: true });
+				updateLockTime();
+				lockTimeUpdater = setInterval(updateLockTime, lockTime/4);
+				break;
+			} catch (err) {
+				console.log(err);
+				// the lock is already acquired by another process
+				if (err.code === 'EEXIST') {
+					let lockWait = 0;
+					let knowLockFile = false;
+					while (lockWait <= lockTime) {
+						try {
+							if ((Date.now() - lockTime) >= Number(readFileSync(`${lockPath}/time`, 'utf8'))) {
+								// the lock file is stale, let's hopefully steal it
+								lockWait = -1;
+								rmSync(lockPath, { recursive: true });
+								break;
+							} else {
+								// let's wait for the lock to disappear/stale
+								await sleep(lockTime/500);
+								lockWait += lockTime/500;
+							}
+						} catch (err) {
+							if (err.code === 'ENOENT') {
+								if (existsSync(lockPath) && !knowLockFile) {
+									// the lock is just being taken/released, let's wait a bit
+									knowLockFile = true;
+									await sleep(lockTime/250);
+									lockWait += lockTime/250;
+								} else {
+									// the lock file just disappeared or it's invalid, let's hopefully make ours
+									lockWait = -1;
+									break;
+								}
+							} else {
+								throw err;
+							}
+						}
+					}
+					if (lockWait !== -1) {
+						const errMsg = 'The database is being kept locked for too much time. Try again later.';
+						throw new NodeOperationError(execFunctions.getNode(), errMsg, { itemIndex });
+						return { error: errMsg };
+					}
+				} else {
+					throw err;
+				}
+			}
+		}
+	}
 	if (existsSync(filePath)) {
-		// try to open database and lock it
 		database = JSON.parse(readFileSync(filePath, 'utf8'));
-		//...
 	}
 	let databaseBranch: IJsonObject = (queryPath ? _.get(database, queryPath) : database);
 	if (options.operation === 'opWrite') {
 		databaseBranch = options.sourceData;
-		queryPath ? _.set(database, queryPath, databaseBranch) : database = {};
-		const directory = filePath.split('/').slice(0, -1).join('/');
+		if ((['string', 'number', 'boolean'].includes(typeof(databaseBranch)) || databaseBranch === null) && !queryPath) {
+			const errMsg = 'Single item values cannot be assigned to the JSON root.';
+			throw new NodeOperationError(execFunctions.getNode(), errMsg, { itemIndex });
+			return { error: errMsg };
+		}
+		queryPath ? _.set(database, queryPath, databaseBranch) : database = databaseBranch;
 		if (!existsSync(directory)) {
-			mkdirSync(directory);
+			mkdirSync(directory, { recursive: true });
 		}
 		writeFileSync(filePath, JSON.stringify(database, null, '\t'));
 	}
-	// release lock
-	//...
-	return databaseBranch;
+	if (lockPath) {
+		clearTimeout(lockTimeUpdater);
+		rmSync(lockPath, { recursive: true });
+	}
+	return { data: databaseBranch };
 }
 
 export class JsonDatabase implements INodeType {
@@ -129,13 +136,13 @@ export class JsonDatabase implements INodeType {
 				noDataExpression: true,
 				options: [
 					{
-						name: 'Read from database',
+						name: 'Read From Database',
 						value: 'opRead',
 						description: 'Reads data from a JSON database',
 						action: 'Read data from a JSON database',
 					},
 					{
-						name: 'Write to database',
+						name: 'Write To Database',
 						value: 'opWrite',
 						description: 'Writes data to a JSON database',
 						action: 'Write data to a JSON database',
@@ -158,14 +165,12 @@ export class JsonDatabase implements INodeType {
 				noDataExpression: true,
 				description: 'The source of the data to write in the chosen database path',
 				options: [
-/*
 					{
 						name: 'Object Key',
 						value: 'sourceTypeObject',
 						description: 'Sets the data source for writing to a specified object key',
 						action: 'Set the data source for writing to a specified object key',
 					},
-*/
 					{
 						name: 'JSON String',
 						value: 'sourceTypeJson',
@@ -173,17 +178,16 @@ export class JsonDatabase implements INodeType {
 						action: 'Set the data source for writing to an arbitrary JSON string',
 					},
 				],
-				default: 'sourceTypeJson', // 'sourceTypeObject',
+				default: 'sourceTypeObject',
 				displayOptions: {
 					show: {
 						'operation': ['opWrite'],
 					},
 				},
 			},
-/*
 			{
 				displayName: 'Source Object Key',
-				name: 'sourceObject',
+				name: 'sourceData',
 				type: 'string',
 				default: '',
 				required: true,
@@ -196,10 +200,9 @@ export class JsonDatabase implements INodeType {
 					},
 				},
 			},
-*/
 			{
 				displayName: 'Source JSON String',
-				name: 'sourceJson',
+				name: 'sourceData',
 				type: 'string',
 				default: '',
 				placeholder: '[ "children", "grandma" ]',
@@ -223,34 +226,28 @@ export class JsonDatabase implements INodeType {
 	};
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		let inputItems = this.getInputData();
-		let operation: string, queryPath: string, sourceType: string, sourceObject: string, sourceJson: string, filePath: string;
+		let sourceData;
 		const returnItems: INodeExecutionData[] = [];
 		for (let itemIndex = 0; itemIndex < inputItems.length; itemIndex++) {
 			try {
-				operation = this.getNodeParameter('operation', itemIndex) as string;
-				queryPath = this.getNodeParameter('queryPath', itemIndex) as string;
-				filePath = this.getNodeParameter('filePath', itemIndex) as string;
-				let sourceData: IJsonObject = {};
+				const operation = this.getNodeParameter('operation', itemIndex) as string;
+				const queryPath = this.getNodeParameter('queryPath', itemIndex) as string;
+				const filePath = this.getNodeParameter('filePath', itemIndex) as string;
 				if (operation === 'opWrite') {
-					sourceType = this.getNodeParameter('sourceType', itemIndex) as string;
+					const sourceType = this.getNodeParameter('sourceType', itemIndex) as string;
+					sourceData = this.getNodeParameter('sourceData', itemIndex) as string;
 					switch (sourceType) {
 						case 'sourceTypeObject':
-							sourceObject = this.getNodeParameter('sourceObject', itemIndex) as string;
-							// sourceData = ...
-							sourceObject;
+							sourceData = _.get(inputItems[itemIndex].json, sourceData);
 							break;
 						case 'sourceTypeJson':
-							sourceJson = this.getNodeParameter('sourceJson', itemIndex) as string;
-							sourceData = (sourceJson.trim() ? JSON.parse(sourceJson.trim()) : undefined);
+							sourceData = (sourceData.trim() ? JSON.parse(sourceData.trim()) : undefined);
 							break;
 					}
 				}
-				const jsonResult = await handleJsonOperation({ operation, queryPath, sourceData, filePath });
-				//if (error !== undefined) {
-				//	throw new NodeOperationError(this.getNode(), error.message, { itemIndex });
-				//}
+				const jsonResult = await handleJsonOperation(this, itemIndex, { operation, queryPath, sourceData, filePath });
 				returnItems.push({
-					json: { data: jsonResult },
+					json: { ...jsonResult },
 					pairedItem: { item: itemIndex },
 				});
 			} catch (error) {
